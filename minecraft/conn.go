@@ -234,6 +234,11 @@ func (conn *Conn) GameData() GameData {
 	return conn.gameData
 }
 
+// Proto returns the protocol of the connection.
+func (conn *Conn) Proto() Protocol {
+	return conn.proto
+}
+
 // StartGame starts the game for a client that connected to the server. StartGame should be called for a Conn
 // obtained using a minecraft.Listener. The game data passed will be used to spawn the player in the world of
 // the server. To spawn a Conn obtained from a call to minecraft.Dial(), use Conn.DoSpawn().
@@ -928,19 +933,6 @@ func (conn *Conn) handleClientToServerHandshake() error {
 				URL:         pack.DownloadURL(),
 			})
 		}
-
-		// If it has behaviours, add it to the behaviour pack list. If not, we add it to the texture packs
-		// list.
-		if pack.HasBehaviours() {
-			behaviourPack := protocol.BehaviourPackInfo{UUID: pack.UUID(), Version: pack.Version(), Size: uint64(pack.Len())}
-			if pack.HasScripts() {
-				// One of the resource packs has scripts, so we set HasScripts in the packet to true.
-				pk.HasScripts = true
-				behaviourPack.HasScripts = true
-			}
-			pk.BehaviourPacks = append(pk.BehaviourPacks, behaviourPack)
-			continue
-		}
 		texturePack := protocol.TexturePackInfo{UUID: pack.UUID(), Version: pack.Version(), Size: uint64(pack.Len())}
 		if pack.Encrypted() {
 			texturePack.ContentKey = pack.ContentKey()
@@ -1014,7 +1006,7 @@ func (conn *Conn) handleClientCacheStatus(pk *packet.ClientCacheStatus) error {
 func (conn *Conn) handleResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 	// First create a new resource pack queue with the information in the packet so we can download them
 	// properly later.
-	totalPacks := len(pk.TexturePacks) + len(pk.BehaviourPacks)
+	totalPacks := len(pk.TexturePacks)
 	conn.packQueue = &resourcePackQueue{
 		packAmount:       totalPacks,
 		downloadingPacks: make(map[string]downloadingPack),
@@ -1025,29 +1017,6 @@ func (conn *Conn) handleResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 	for index, pack := range pk.TexturePacks {
 		if _, ok := conn.packQueue.downloadingPacks[pack.UUID]; ok {
 			conn.log.Printf("handle ResourcePacksInfo: duplicate texture pack (UUID=%v)\n", pack.UUID)
-			conn.packQueue.packAmount--
-			continue
-		}
-		if conn.downloadResourcePack != nil && !conn.downloadResourcePack(uuid.MustParse(pack.UUID), pack.Version, index, totalPacks) {
-			conn.ignoredResourcePacks = append(conn.ignoredResourcePacks, exemptedResourcePack{
-				uuid:    pack.UUID,
-				version: pack.Version,
-			})
-			conn.packQueue.packAmount--
-			continue
-		}
-		// This UUID_Version is a hack Mojang put in place.
-		packsToDownload = append(packsToDownload, pack.UUID+"_"+pack.Version)
-		conn.packQueue.downloadingPacks[pack.UUID] = downloadingPack{
-			size:       pack.Size,
-			buf:        bytes.NewBuffer(make([]byte, 0, pack.Size)),
-			newFrag:    make(chan []byte),
-			contentKey: pack.ContentKey,
-		}
-	}
-	for index, pack := range pk.BehaviourPacks {
-		if _, ok := conn.packQueue.downloadingPacks[pack.UUID]; ok {
-			conn.log.Printf("handle ResourcePacksInfo: duplicate behaviour pack (UUID=%v)\n", pack.UUID)
 			conn.packQueue.packAmount--
 			continue
 		}
