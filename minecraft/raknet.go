@@ -2,6 +2,7 @@ package minecraft
 
 import (
 	"context"
+	"log/slog"
 	"net"
 
 	"github.com/sandertv/go-raknet"
@@ -9,7 +10,9 @@ import (
 )
 
 // RakNet is an implementation of a RakNet v10 Network.
-type RakNet struct{}
+type RakNet struct {
+	l *slog.Logger
+}
 
 // DialContext ...
 func (r RakNet) DialContext(ctx context.Context, address string) (net.Conn, error) {
@@ -30,5 +33,5 @@ func (RakNet) Compression(net.Conn) packet.Compression { return packet.FlateComp
 
 // init registers the RakNet network.
 func init() {
-	RegisterNetwork("raknet", RakNet{})
+	RegisterNetwork("raknet", func(l *slog.Logger) Network { return RakNet{l: l} })
 }
