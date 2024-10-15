@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/go-gl/mathgl/mgl32"
-	"github.com/google/uuid"
-	"github.com/sandertv/gophertunnel/minecraft/nbt"
 	"image/color"
 	"io"
 	"math"
 	"unsafe"
+
+	"github.com/go-gl/mathgl/mgl32"
+	"github.com/google/uuid"
+	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
 // Reader implements reading operations for reading types from Minecraft packets. Each Packet implementation
@@ -31,6 +32,19 @@ func NewReader(r interface {
 	io.ByteReader
 }, shieldID int32, enableLimits bool) *Reader {
 	return &Reader{r: r, shieldID: shieldID, limitsEnabled: enableLimits}
+}
+
+type Reads interface {
+	Reads() bool
+	LimitsEnabled() bool
+}
+
+func (r *Reader) Reads() bool {
+	return true
+}
+
+func (r *Reader) LimitsEnabled() bool {
+	return r.limitsEnabled
 }
 
 // Uint8 reads a uint8 from the underlying buffer.

@@ -12,17 +12,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
 	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/uuid"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
-	"github.com/sandertv/gophertunnel/minecraft/internal"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"golang.org/x/oauth2"
-	"log/slog"
+	"log"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -31,9 +32,9 @@ import (
 // Dialer allows specifying specific settings for connection to a Minecraft server.
 // The zero value of Dialer is used for the package level Dial function.
 type Dialer struct {
-	// ErrorLog is a log.Logger that errors that occur during packet handling of
-	// servers are written to. By default, errors are not logged.
-	ErrorLog *slog.Logger
+	// ErrorLog is a log.Logger that errors that occur during packet handling of servers are written to. By
+	// default, ErrorLog is set to one equal to the global logger.
+	ErrorLog *log.Logger
 
 	// ClientData is the client data used to login to the server with. It includes fields such as the skin,
 	// locale and UUIDs unique to the client. If empty, a default is sent produced using defaultClientData().
@@ -73,6 +74,9 @@ type Dialer struct {
 	// packets with too many bytes will be returned while packets with too few bytes will be skipped.
 	DisconnectOnInvalidPackets bool
 
+	// ReadBatches is an option if you want to read batches instead of individual packets.
+	ReadBatches bool
+
 	// Protocol is the Protocol version used to communicate with the target server. By default, this field is
 	// set to the current protocol as implemented in the minecraft/protocol package. Note that packets written
 	// to and read from the Conn are always any of those found in the protocol/packet package, as packets
@@ -86,6 +90,8 @@ type Dialer struct {
 	// will not be flushed automatically. In this case, calling `(*Conn).Flush()` is required after any
 	// calls to `(*Conn).Write()` or `(*Conn).WritePacket()` to send the packets over network.
 	FlushRate time.Duration
+
+	IPAddress string
 
 	// EnableClientCache, if set to true, enables the client blob cache for the client. This means that the
 	// server will send chunks as blobs, which may be saved by the client so that chunks don't have to be
@@ -148,18 +154,8 @@ func (d Dialer) DialTimeout(network, address string, timeout time.Duration) (*Co
 // typically "raknet". A Conn is returned which may be used to receive packets from and send packets to.
 // If a connection is not established before the context passed is cancelled, DialContext returns an error.
 func (d Dialer) DialContext(ctx context.Context, network, address string) (conn *Conn, err error) {
-	if d.ErrorLog == nil {
-		d.ErrorLog = slog.New(internal.DiscardHandler{})
-	}
-	d.ErrorLog = d.ErrorLog.With("src", "dialer")
-	if d.Protocol == nil {
-		d.Protocol = DefaultProtocol
-	}
-	if d.FlushRate == 0 {
-		d.FlushRate = time.Second / 20
-	}
-
 	key, _ := ecdsa.GenerateKey(elliptic.P384(), cryptorand.Reader)
+
 	var chainData string
 	if d.TokenSource != nil {
 		chainData, err = authChain(ctx, d.TokenSource, key)
@@ -168,10 +164,19 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 		}
 		d.IdentityData = readChainIdentityData([]byte(chainData))
 	}
+	if d.ErrorLog == nil {
+		d.ErrorLog = log.New(os.Stderr, "", log.LstdFlags)
+	}
+	if d.Protocol == nil {
+		d.Protocol = DefaultProtocol
+	}
+	if d.FlushRate == 0 {
+		d.FlushRate = time.Second / 20
+	}
 
-	n, ok := networkByID(network, d.ErrorLog)
+	n, ok := networkByID(network)
 	if !ok {
-		return nil, &net.OpError{Op: "dial", Net: "minecraft", Err: fmt.Errorf("dial: no network under id %v", network)}
+		return nil, fmt.Errorf("dial: no network under id %v", network)
 	}
 
 	var pong []byte
@@ -185,7 +190,7 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 		return nil, err
 	}
 
-	conn = newConn(netConn, key, d.ErrorLog, d.Protocol, d.FlushRate, false)
+	conn = newConn(netConn, key, d.ErrorLog, d.Protocol, d.FlushRate, false, d.ReadBatches)
 	conn.pool = conn.proto.Packets(false)
 	conn.identityData = d.IdentityData
 	conn.clientData = d.ClientData
@@ -219,35 +224,51 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (conn 
 		conn.identityData = identityData
 	}
 
-	readyForLogin, connected := make(chan struct{}), make(chan struct{})
-	ctx, cancel := context.WithCancelCause(ctx)
-	go listenConn(conn, readyForLogin, connected, cancel)
+	l, c := make(chan struct{}), make(chan struct{})
+	go listenConn(conn, d.ErrorLog, l, c)
 
 	conn.expect(packet.IDNetworkSettings, packet.IDPlayStatus)
 	if err := conn.WritePacket(&packet.RequestNetworkSettings{ClientProtocol: d.Protocol.ID()}); err != nil {
-		return nil, conn.wrap(fmt.Errorf("send request network settings: %w", err), "dial")
+		return nil, err
 	}
-	_ = conn.Flush()
+
+	fchan := make(chan bool, 1)
+	go func() {
+		t := time.NewTicker(time.Millisecond * 50)
+		for {
+			select {
+			case <-t.C:
+				conn.Flush()
+			case <-fchan:
+				return
+			}
+		}
+	}()
 
 	select {
-	case <-ctx.Done():
-		return nil, conn.wrap(context.Cause(ctx), "dial")
 	case <-conn.close:
+		fchan <- true
 		return nil, conn.closeErr("dial")
-	case <-readyForLogin:
+	case <-ctx.Done():
+		fchan <- true
+		return nil, conn.wrap(ctx.Err(), "dial")
+	case <-l:
 		// We've received our network settings, so we can now send our login request.
 		conn.expect(packet.IDServerToClientHandshake, packet.IDPlayStatus)
 		if err := conn.WritePacket(&packet.Login{ConnectionRequest: request, ClientProtocol: d.Protocol.ID()}); err != nil {
-			return nil, conn.wrap(fmt.Errorf("send login: %w", err), "dial")
+			return nil, err
 		}
 		_ = conn.Flush()
 
 		select {
-		case <-ctx.Done():
-			return nil, conn.wrap(context.Cause(ctx), "dial")
 		case <-conn.close:
+			fchan <- true
 			return nil, conn.closeErr("dial")
-		case <-connected:
+		case <-ctx.Done():
+			fchan <- true
+			return nil, conn.wrap(ctx.Err(), "dial")
+		case <-c:
+			fchan <- true
 			// We've connected successfully. We return the connection and no error.
 			return conn, nil
 		}
@@ -280,45 +301,58 @@ func readChainIdentityData(chainData []byte) login.IdentityData {
 
 // listenConn listens on the connection until it is closed on another goroutine. The channel passed will
 // receive a value once the connection is logged in.
-func listenConn(conn *Conn, readyForLogin, connected chan struct{}, cancel context.CancelCauseFunc) {
+func listenConn(conn *Conn, logger *log.Logger, l, c chan struct{}) {
 	defer func() {
 		_ = conn.Close()
 	}()
-	cancelContext := true
 	for {
 		// We finally arrived at the packet decoding loop. We constantly decode packets that arrive
 		// and push them to the Conn so that they may be processed.
 		packets, err := conn.dec.Decode()
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				if cancelContext {
-					cancel(err)
-				} else {
-					conn.log.Error(err.Error())
-				}
+				logger.Printf("dialer conn: %v\n", err)
 			}
 			return
 		}
+
+		if conn.readBatches {
+			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
+			if err := conn.receiveMultiple(packets); err != nil {
+				logger.Printf("error: %v", err)
+				return
+			}
+
+			if !readyToLoginBefore && conn.readyToLogin {
+				// This is the signal that the connection is ready to login, so we put a value in the channel so that
+				// it may be detected.
+				l <- struct{}{}
+			}
+
+			if !loggedInBefore && conn.loggedIn {
+				// This is the signal that the connection was considered logged in, so we put a value in the channel so
+				// that it may be detected.
+				c <- struct{}{}
+			}
+
+			continue
+		}
+
 		for _, data := range packets {
 			loggedInBefore, readyToLoginBefore := conn.loggedIn, conn.readyToLogin
 			if err := conn.receive(data); err != nil {
-				if cancelContext {
-					cancel(err)
-				} else {
-					conn.log.Error(err.Error())
-				}
+				logger.Printf("dialer conn: %v", err)
 				return
 			}
 			if !readyToLoginBefore && conn.readyToLogin {
 				// This is the signal that the connection is ready to login, so we put a value in the channel so that
 				// it may be detected.
-				readyForLogin <- struct{}{}
+				l <- struct{}{}
 			}
 			if !loggedInBefore && conn.loggedIn {
 				// This is the signal that the connection was considered logged in, so we put a value in the channel so
 				// that it may be detected.
-				cancelContext = false
-				connected <- struct{}{}
+				c <- struct{}{}
 			}
 		}
 	}

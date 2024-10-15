@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"fmt"
 	"github.com/google/uuid"
 )
 
@@ -85,6 +86,19 @@ type PlayerListEntry struct {
 
 // Marshal encodes/decodes a PlayerListEntry.
 func (x *PlayerListEntry) Marshal(r IO) {
+	defer func() {
+		if err := recover(); err != nil {
+			var action string
+			if _, reader := r.(Reads); reader {
+				action = "decoding"
+			} else {
+				action = "encoding"
+			}
+
+			panic(fmt.Errorf("error while %s skin '%s' of player %s: %v", action, x.Skin.SkinID, x.Username, err))
+		}
+	}()
+
 	r.UUID(&x.UUID)
 	r.Varint64(&x.EntityUniqueID)
 	r.String(&x.Username)

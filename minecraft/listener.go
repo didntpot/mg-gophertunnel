@@ -6,23 +6,25 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"github.com/sandertv/gophertunnel/minecraft/internal"
-	"github.com/sandertv/gophertunnel/minecraft/protocol"
-	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
-	"github.com/sandertv/gophertunnel/minecraft/resource"
-	"log/slog"
+	"log"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet"
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
+	"github.com/sandertv/gophertunnel/minecraft/resource"
 )
 
 // ListenConfig holds settings that may be edited to change behaviour of a Listener.
 type ListenConfig struct {
-	// ErrorLog is a log.Logger that errors that occur during packet handling of
-	// clients are written to. By default, errors are not logged.
-	ErrorLog *slog.Logger
+	// ErrorLog is a log.Logger that errors that occur during packet handling of clients are written to. By
+	// default, ErrorLog is set to one equal to the global logger.
+	ErrorLog *log.Logger
 
 	// AuthenticationDisabled specifies if authentication of players that join is disabled. If set to true, no
 	// verification will be done to ensure that the player connecting is authenticated using their XBOX Live
@@ -63,6 +65,9 @@ type ListenConfig struct {
 	// will not be flushed automatically. In this case, calling `(*Conn).Flush()` is required after any
 	// calls to `(*Conn).Write()` or `(*Conn).WritePacket()` to send the packets over network.
 	FlushRate time.Duration
+	// ReadBatches determines whether packets should be retrieved in conn's batches. When enabled, the conn.ReadBatch()
+	// function should be used as opposed to conn.ReadPacket()
+	ReadBatches bool
 
 	// ResourcePacks is a slice of resource packs that the listener may hold. Each client will be asked to
 	// download these resource packs upon joining.
@@ -107,10 +112,19 @@ type Listener struct {
 // If the host in the address parameter is empty or a literal unspecified IP address, Listen listens on all
 // available unicast and anycast IP addresses of the local system.
 func (cfg ListenConfig) Listen(network string, address string) (*Listener, error) {
-	if cfg.ErrorLog == nil {
-		cfg.ErrorLog = slog.New(internal.DiscardHandler{})
+	n, ok := networkByID(network)
+	if !ok {
+		return nil, fmt.Errorf("listen: no network under id %v", network)
 	}
-	cfg.ErrorLog = cfg.ErrorLog.With("src", "listener")
+
+	netListener, err := n.Listen(address)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.ErrorLog == nil {
+		cfg.ErrorLog = log.New(os.Stderr, "", log.LstdFlags)
+	}
 	if cfg.StatusProvider == nil {
 		cfg.StatusProvider = NewStatusProvider("Minecraft Server", "Gophertunnel")
 	}
@@ -119,16 +133,6 @@ func (cfg ListenConfig) Listen(network string, address string) (*Listener, error
 	}
 	if cfg.FlushRate == 0 {
 		cfg.FlushRate = time.Second / 20
-	}
-
-	n, ok := networkByID(network, cfg.ErrorLog)
-	if !ok {
-		return nil, fmt.Errorf("listen: no network under id %v", network)
-	}
-
-	netListener, err := n.Listen(address)
-	if err != nil {
-		return nil, err
 	}
 	key, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	listener := &Listener{
@@ -141,7 +145,7 @@ func (cfg ListenConfig) Listen(network string, address string) (*Listener, error
 	}
 
 	// Actually start listening.
-	go listener.listen()
+	go listener.listen(n)
 	return listener, nil
 }
 
@@ -163,7 +167,7 @@ func Listen(network, address string) (*Listener, error) {
 func (listener *Listener) Accept() (net.Conn, error) {
 	conn, ok := <-listener.incoming
 	if !ok {
-		return nil, &net.OpError{Op: "accept", Net: "minecraft", Addr: listener.Addr(), Err: net.ErrClosed}
+		return nil, &net.OpError{Op: "accept", Net: "minecraft", Addr: listener.Addr(), Err: errListenerClosed}
 	}
 	return conn, nil
 }
@@ -213,13 +217,14 @@ func (listener *Listener) updatePongData() {
 	s := listener.status()
 	listener.listener.PongData([]byte(fmt.Sprintf("MCPE;%v;%v;%v;%v;%v;%v;%v;%v;%v;%v;%v;%v;",
 		s.ServerName, protocol.CurrentProtocol, protocol.CurrentVersion, s.PlayerCount, s.MaxPlayers,
-		listener.listener.ID(), s.ServerSubName, "Creative", 1, listener.Addr().(*net.UDPAddr).Port, listener.Addr().(*net.UDPAddr).Port, 0,
+		listener.listener.ID(), s.ServerSubName, "Creative", 1, listener.Addr().(*net.UDPAddr).Port, listener.Addr().(*net.UDPAddr).Port,
+		0,
 	)))
 }
 
 // listen starts listening for incoming connections and packets. When a player is fully connected, it submits
 // it to the accepted connections channel so that a call to Accept can pick it up.
-func (listener *Listener) listen() {
+func (listener *Listener) listen(n Network) {
 	listener.updatePongData()
 	go func() {
 		ticker := time.NewTicker(time.Second * 4)
@@ -245,22 +250,24 @@ func (listener *Listener) listen() {
 			// close too.
 			return
 		}
-		listener.createConn(netConn)
+		listener.createConn(n, netConn)
 	}
 }
 
 // createConn creates a connection for the net.Conn passed and adds it to the listener, so that it may be
 // accepted once its login sequence is complete.
-func (listener *Listener) createConn(netConn net.Conn) {
+func (listener *Listener) createConn(n Network, netConn net.Conn) {
 	listener.packsMu.RLock()
 	packs := slices.Clone(listener.packs)
 	listener.packsMu.RUnlock()
 
-	conn := newConn(netConn, listener.key, listener.cfg.ErrorLog, proto{}, listener.cfg.FlushRate, true)
+	conn := newConn(netConn, listener.key, listener.cfg.ErrorLog, proto{}, listener.cfg.FlushRate, true, listener.cfg.ReadBatches)
 	conn.acceptedProto = append(listener.cfg.AcceptedProtocols, proto{})
 	conn.compression = listener.cfg.Compression
 	conn.pool = conn.proto.Packets(true)
-
+	// Temporarily set the protocol to the latest: We don't know the actual protocol until we read the Login packet.
+	conn.proto = proto{}
+	conn.pool = conn.proto.Packets(true)
 	conn.packetFunc = listener.cfg.PacketFunc
 	conn.texturePacksRequired = listener.cfg.TexturePacksRequired
 	conn.resourcePacks = packs
@@ -269,6 +276,11 @@ func (listener *Listener) createConn(netConn net.Conn) {
 	conn.authEnabled = !listener.cfg.AuthenticationDisabled
 	conn.disconnectOnUnknownPacket = !listener.cfg.AllowUnknownPackets
 	conn.disconnectOnInvalidPacket = !listener.cfg.AllowInvalidPackets
+
+	if netConn.(*raknet.Conn).ProtocolVersion() <= 10 {
+		conn.enc.EnableCompression(n.Compression(netConn), true)
+		conn.dec.SetCompression(n.Compression(netConn))
+	}
 
 	if listener.playerCount.Load() == int32(listener.cfg.MaximumPlayers) && listener.cfg.MaximumPlayers != 0 {
 		// The server was full. We kick the player immediately and close the connection.
@@ -305,14 +317,37 @@ func (listener *Listener) handleConn(conn *Conn) {
 		packets, err := conn.dec.Decode()
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				conn.log.Error(err.Error())
+				conn.log.Printf("listener conn: %v\n", err)
 			}
 			return
 		}
+
+		if conn.readBatches {
+			loggedInBefore := conn.loggedIn
+			if err := conn.receiveMultiple(packets); err != nil {
+				conn.log.Printf("listener conn: %v\n", err)
+				return
+			}
+			if !loggedInBefore && conn.loggedIn {
+				select {
+				case <-listener.close:
+					// The listener was closed while this one was logged in, so the incoming channel will be
+					// closed. Just return so the connection is closed and cleaned up.
+					return
+				case listener.incoming <- conn:
+					// The connection was previously not logged in, but was after receiving this packet,
+					// meaning the connection is fully completely now. We add it to the channel so that
+					// a call to Accept() can receive it.
+				}
+			}
+
+			continue
+		}
+
 		for _, data := range packets {
 			loggedInBefore := conn.loggedIn
 			if err := conn.receive(data); err != nil {
-				conn.log.Error(err.Error())
+				conn.log.Printf("listener conn: %v", err)
 				return
 			}
 			if !loggedInBefore && conn.loggedIn {
